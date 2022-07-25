@@ -27,17 +27,23 @@ import time
 class Zip64Test(unittest.TestCase):
   @staticmethod
   def _WriteFile(path, size_in_kib):
-    contents = os.path.basename(path)[0] * 1024
-    with open(path, 'w') as f:
-      for it in range(0, size_in_kib):
+    contents = b'X' * 1024
+    with open(path, 'wb') as f:
+      for i in range(size_in_kib):
         f.write(contents)
 
   @staticmethod
   def _AddEntriesToZip(output_zip, entries_dict=None):
+    contents = b'X' * 1024
     for name, size in entries_dict.items():
-      with tempfile.NamedTemporaryFile() as file_path:
-        Zip64Test._WriteFile(file_path.name, size)
-        output_zip.write(file_path.name, arcname = name)
+      # Need to pass a ZipInfo with a file_size
+      # to .open() so that it adds the Zip64 header
+      # on larger files
+      info = zipfile.ZipInfo(name)
+      info.file_size = size * 1024
+      with output_zip.open(info, mode='w') as f:
+        for i in range(size):
+          f.write(contents)
 
   def _getEntryNames(self, zip_name):
     cmd = ['ziptool', 'zipinfo', '-1', zip_name]
