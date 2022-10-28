@@ -23,6 +23,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <limits>
 #include <memory>
 #include <vector>
 
