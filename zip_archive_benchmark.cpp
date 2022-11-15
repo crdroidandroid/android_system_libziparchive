@@ -17,8 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
-#include <tuple>
+#include <string_view>
 #include <vector>
 
 #include <android-base/test_utils.h>
@@ -32,11 +33,14 @@ static std::unique_ptr<TemporaryFile> CreateZip(int size = 4, int count = 1000) 
   FILE* fp = fdopen(result->fd, "w");
 
   ZipWriter writer(fp);
-  std::string lastName = "file";
+  std::string baseName = "file";
   for (size_t i = 0; i < count; i++) {
     // Make file names longer and longer.
-    lastName = lastName + std::to_string(i);
-    writer.StartEntry(lastName.c_str(), ZipWriter::kCompress);
+    if (i && (i % 100 == 0)) {
+      baseName += "more";
+    }
+    std::string name = baseName + std::to_string(i);
+    writer.StartEntry(name.c_str(), ZipWriter::kCompress);
     while (size > 0) {
       writer.WriteBytes("helo", 4);
       size -= 4;
@@ -49,9 +53,19 @@ static std::unique_ptr<TemporaryFile> CreateZip(int size = 4, int count = 1000) 
   return result;
 }
 
+static void OpenClose(benchmark::State& state) {
+  std::unique_ptr<TemporaryFile> temp_file(CreateZip(4, int(state.range(0))));
+  ZipArchiveHandle handle;
+  for (auto _ : state) {
+    OpenArchive(temp_file->path, &handle);
+    CloseArchive(handle);
+  }
+}
+BENCHMARK(OpenClose)->Arg(1)->Arg(10)->Arg(1000)->Arg(10000);
+
 static void FindEntry_no_match(benchmark::State& state) {
   // Create a temporary zip archive.
-  std::unique_ptr<TemporaryFile> temp_file(CreateZip());
+  std::unique_ptr<TemporaryFile> temp_file(CreateZip(4, int(state.range(0))));
   ZipArchiveHandle handle;
   ZipEntry data;
 
@@ -60,31 +74,31 @@ static void FindEntry_no_match(benchmark::State& state) {
   std::string_view name("thisFileNameDoesNotExist");
 
   // Start the benchmark.
+  OpenArchive(temp_file->path, &handle);
   for (auto _ : state) {
-    OpenArchive(temp_file->path, &handle);
     FindEntry(handle, name, &data);
-    CloseArchive(handle);
   }
+  CloseArchive(handle);
 }
-BENCHMARK(FindEntry_no_match);
+BENCHMARK(FindEntry_no_match)->Arg(1)->Arg(10)->Arg(1000)->Arg(10000);
 
 static void Iterate_all_files(benchmark::State& state) {
-  std::unique_ptr<TemporaryFile> temp_file(CreateZip());
+  std::unique_ptr<TemporaryFile> temp_file(CreateZip(4, int(state.range(0))));
   ZipArchiveHandle handle;
   void* iteration_cookie;
   ZipEntry data;
-  std::string name;
+  std::string_view name;
 
+  OpenArchive(temp_file->path, &handle);
   for (auto _ : state) {
-    OpenArchive(temp_file->path, &handle);
     StartIteration(handle, &iteration_cookie);
     while (Next(iteration_cookie, &data, &name) == 0) {
     }
     EndIteration(iteration_cookie);
-    CloseArchive(handle);
   }
+  CloseArchive(handle);
 }
-BENCHMARK(Iterate_all_files);
+BENCHMARK(Iterate_all_files)->Arg(1)->Arg(10)->Arg(1000)->Arg(10000);
 
 static void StartAlignedEntry(benchmark::State& state) {
   TemporaryFile file;
@@ -98,7 +112,6 @@ static void StartAlignedEntry(benchmark::State& state) {
   for (auto _ : state) {
     writer.StartAlignedEntry(name + std::to_string(counter++), 0, alignment);
     state.PauseTiming();
-    writer.WriteBytes("hola", 4);
     writer.FinishEntry();
     state.ResumeTiming();
   }
@@ -109,7 +122,8 @@ static void StartAlignedEntry(benchmark::State& state) {
 BENCHMARK(StartAlignedEntry)->Arg(2)->Arg(16)->Arg(1024)->Arg(4096);
 
 static void ExtractEntry(benchmark::State& state) {
-  std::unique_ptr<TemporaryFile> temp_file(CreateZip(1024 * 1024, 1));
+  const auto size = int(state.range(0));
+  std::unique_ptr<TemporaryFile> temp_file(CreateZip(size * 1024, 1));
 
   ZipArchiveHandle handle;
   ZipEntry data;
@@ -120,7 +134,7 @@ static void ExtractEntry(benchmark::State& state) {
     state.SkipWithError("Failed to find archive entry");
   }
 
-  std::vector<uint8_t> buffer(1024 * 1024);
+  std::vector<uint8_t> buffer(size * 1024);
   for (auto _ : state) {
     if (ExtractToMemory(handle, &data, buffer.data(), uint32_t(buffer.size()))) {
       state.SkipWithError("Failed to extract archive entry");
@@ -130,6 +144,6 @@ static void ExtractEntry(benchmark::State& state) {
   CloseArchive(handle);
 }
 
-BENCHMARK(ExtractEntry)->Arg(2)->Arg(16)->Arg(1024);
+BENCHMARK(ExtractEntry)->Arg(2)->Arg(16)->Arg(64)->Arg(1024)->Arg(4096);
 
 BENCHMARK_MAIN();
