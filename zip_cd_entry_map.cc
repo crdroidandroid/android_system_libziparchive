@@ -101,13 +101,13 @@ std::pair<std::string_view, uint64_t> CdEntryMapZip32::Next(const uint8_t* cd_st
 
 CdEntryMapZip32::CdEntryMapZip32(uint16_t num_entries) {
   /*
-   * Create hash table.  We have a minimum 75% load factor, possibly as
+   * Create hash table.  We have a maximum 75% load factor, possibly as
    * low as 50% after we round off to a power of 2.  There must be at
    * least one unused entry to avoid an infinite loop during creation.
    */
   hash_table_size_ = RoundUpPower2(1 + (num_entries * 4) / 3);
-  hash_table_ = {
-      reinterpret_cast<ZipStringOffset*>(calloc(hash_table_size_, sizeof(ZipStringOffset))), free};
+  hash_table_.reset(
+      static_cast<ZipStringOffset*>(calloc(hash_table_size_, sizeof(ZipStringOffset))));
 }
 
 std::unique_ptr<CdEntryMapInterface> CdEntryMapZip32::Create(uint16_t num_entries) {

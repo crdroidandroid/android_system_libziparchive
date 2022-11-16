@@ -54,7 +54,7 @@ class MappedZipFile {
 
   off64_t GetFileLength() const;
 
-  bool ReadAtOffset(uint8_t* buf, size_t len, off64_t off) const;
+  const uint8_t* ReadAtOffset(uint8_t* buf, size_t len, off64_t off) const;
 
  private:
   // If has_fd_ is true, fd is valid and we'll read contents of a zip archive
@@ -112,6 +112,11 @@ static T ConsumeUnaligned(uint8_t** address) {
   auto ret = android::base::get_unaligned<T>(*address);
   *address += sizeof(T);
   return ret;
+}
+
+template <typename T>
+static T ConsumeUnaligned(const uint8_t** address) {
+  return ConsumeUnaligned<T>(const_cast<uint8_t**>(address));
 }
 
 // Writes the unaligned data of type |T| and auto increment the offset.
