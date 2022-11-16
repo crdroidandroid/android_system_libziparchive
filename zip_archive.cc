@@ -956,7 +956,7 @@ struct IterationHandle {
   IterationHandle(ZipArchive* archive, std::function<bool(std::string_view)> in_matcher)
       : archive(archive), matcher(std::move(in_matcher)) {}
 
-  bool Match(std::string_view entry_name) const { return matcher(entry_name); }
+  bool Match(std::string_view entry_name) const { return !matcher || matcher(entry_name); }
 };
 
 int32_t StartIteration(ZipArchiveHandle archive, void** cookie_ptr,
@@ -966,6 +966,9 @@ int32_t StartIteration(ZipArchiveHandle archive, void** cookie_ptr,
       optional_suffix.size() > static_cast<size_t>(UINT16_MAX)) {
     ALOGW("Zip: prefix/suffix too long");
     return kInvalidEntryName;
+  }
+  if (optional_prefix.empty() && optional_suffix.empty()) {
+    return StartIteration(archive, cookie_ptr, std::function<bool(std::string_view)>{});
   }
   auto matcher = [prefix = std::string(optional_prefix),
                   suffix = std::string(optional_suffix)](std::string_view name) mutable {
