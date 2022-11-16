@@ -886,7 +886,7 @@ TEST(ziparchive, BrokenLfhSignature) {
   ASSERT_EQ(kInvalidFile, OpenArchiveFd(tmp_file.fd, "LeadingNonZipBytes", &handle, false));
 }
 
-class VectorReader : public zip_archive::Reader {
+class VectorReader final : public zip_archive::Reader {
  public:
   VectorReader(const std::vector<uint8_t>& input) : Reader(), input_(input) {}
 
@@ -903,7 +903,7 @@ class VectorReader : public zip_archive::Reader {
   const std::vector<uint8_t>& input_;
 };
 
-class VectorWriter : public zip_archive::Writer {
+class VectorWriter final : public zip_archive::Writer {
  public:
   VectorWriter() : Writer() {}
 
@@ -918,14 +918,14 @@ class VectorWriter : public zip_archive::Writer {
   std::vector<uint8_t> output_;
 };
 
-class BadReader : public zip_archive::Reader {
+class BadReader final : public zip_archive::Reader {
  public:
   BadReader() : Reader() {}
 
   bool ReadAtOffset(uint8_t*, size_t, off64_t) const { return false; }
 };
 
-class BadWriter : public zip_archive::Writer {
+class BadWriter final : public zip_archive::Writer {
  public:
   BadWriter() : Writer() {}
 

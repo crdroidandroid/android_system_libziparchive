@@ -87,8 +87,11 @@ class CdEntryMapZip32 : public CdEntryMapInterface {
   // fixed-size hash table. We define a load factor of 0.75 and over
   // allocate so the maximum number entries can never be higher than
   // ((4 * UINT16_MAX) / 3 + 1) which can safely fit into a uint32_t.
+  struct FreeDeleter {
+    void operator()(void* ptr) const { ::free(ptr); }
+  };
+  std::unique_ptr<ZipStringOffset[], FreeDeleter> hash_table_;
   uint32_t hash_table_size_{0};
-  std::unique_ptr<ZipStringOffset[], decltype(&free)> hash_table_{nullptr, free};
 
   // The position of element for the current iteration.
   uint32_t current_position_{0};
