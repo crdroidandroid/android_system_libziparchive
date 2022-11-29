@@ -31,6 +31,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
+
 #include <memory>
 #include <optional>
 #include <span>
@@ -99,7 +104,7 @@ uint64_t GetOwnerTag(const ZipArchive* archive) {
 #endif
 
 ZipArchive::ZipArchive(MappedZipFile&& map, bool assume_ownership)
-    : mapped_zip(map),
+    : mapped_zip(std::move(map)),
       close_file(assume_ownership),
       directory_offset(0),
       central_directory(),
@@ -107,7 +112,7 @@ ZipArchive::ZipArchive(MappedZipFile&& map, bool assume_ownership)
       num_entries(0) {
 #if defined(__BIONIC__)
   if (assume_ownership) {
-    CHECK(mapped_zip.HasFd());
+    CHECK(mapped_zip.GetFileDescriptor() >= 0 || !mapped_zip.GetBasePtr());
     android_fdsan_exchange_owner_tag(mapped_zip.GetFileDescriptor(), 0, GetOwnerTag(this));
   }
 #endif
@@ -299,7 +304,8 @@ static ZipError FindCentralDirectoryInfo(const char* debug_file_name,
  *   num_entries
  */
 static ZipError MapCentralDirectory(const char* debug_file_name, ZipArchive* archive) {
-  // Test file length. We use lseek64 to make sure the file is small enough to be a zip file.
+  // Test file length. We want to make sure the file is small enough to be a zip
+  // file.
   off64_t file_length = archive->mapped_zip.GetFileLength();
   if (file_length == -1) {
     return kInvalidFile;
@@ -1292,9 +1298,10 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
                            const uint64_t compressed_length,
                            const uint64_t uncompressed_length,
                            zip_archive::Writer* writer, uint64_t* crc_out) {
-  const size_t kBufSize = 32768;
-  std::vector<uint8_t> read_buf(kBufSize);
-  std::vector<uint8_t> write_buf(kBufSize);
+  constexpr uint64_t kBufSize = 32768;
+  std::vector<uint8_t> read_buf(static_cast<size_t>(std::min(compressed_length, kBufSize)));
+  std::vector<uint8_t> write_buf(
+      static_cast<size_t>(std::min(std::max(compressed_length, uncompressed_length), kBufSize)));
   z_stream zstream;
   int zerr;
 
@@ -1308,7 +1315,7 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
   zstream.next_in = NULL;
   zstream.avail_in = 0;
   zstream.next_out = &write_buf[0];
-  zstream.avail_out = kBufSize;
+  zstream.avail_out = static_cast<uint32_t>(write_buf.size());
   zstream.data_type = Z_UNKNOWN;
 
   /*
@@ -1346,8 +1353,8 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
   do {
     /* read as much as we can */
     if (zstream.avail_in == 0) {
-      const uint32_t read_size =
-          (remaining_bytes > kBufSize) ? kBufSize : static_cast<uint32_t>(remaining_bytes);
+      const auto read_size =
+          static_cast<uint32_t>(std::min(remaining_bytes, uint64_t(read_buf.size())));
       const off64_t offset = (compressed_length - remaining_bytes);
       // Make sure to read at offset to ensure concurrent access to the fd.
       auto buf = reader.AccessAtOffset(read_buf.data(), read_size, offset);
@@ -1371,18 +1378,18 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
     }
 
     /* write when we're full or when we're done */
-    if (zstream.avail_out == 0 || (zerr == Z_STREAM_END && zstream.avail_out != kBufSize)) {
+    if (zstream.avail_out == 0 || (zerr == Z_STREAM_END && zstream.avail_out != write_buf.size())) {
       const size_t write_size = zstream.next_out - &write_buf[0];
       if (!writer->Append(&write_buf[0], write_size)) {
         return kIoError;
       } else if (compute_crc) {
-        DCHECK_LE(write_size, kBufSize);
+        DCHECK_LE(write_size, write_buf.size());
         crc = crc32(crc, &write_buf[0], static_cast<uint32_t>(write_size));
       }
 
-      total_output += kBufSize - zstream.avail_out;
+      total_output += write_buf.size() - zstream.avail_out;
       zstream.next_out = &write_buf[0];
-      zstream.avail_out = kBufSize;
+      zstream.avail_out = static_cast<uint32_t>(write_buf.size());
     }
   } while (zerr == Z_OK);
 
@@ -1415,8 +1422,8 @@ static int32_t InflateEntryToWriter(MappedZipFile& mapped_zip, const ZipEntry64*
 
 static int32_t CopyEntryToWriter(MappedZipFile& mapped_zip, const ZipEntry64* entry,
                                  zip_archive::Writer* writer, uint64_t* crc_out) {
-  static const uint32_t kBufSize = 32768;
-  std::vector<uint8_t> buf(kBufSize);
+  constexpr uint64_t kBufSize = 32768;
+  std::vector<uint8_t> buf(static_cast<size_t>(std::min(entry->uncompressed_length, kBufSize)));
 
   SCOPED_SIGBUS_HANDLER({
     incfs::util::clearAndFree(buf);
@@ -1430,9 +1437,8 @@ static int32_t CopyEntryToWriter(MappedZipFile& mapped_zip, const ZipEntry64* en
     uint64_t remaining = length - count;
     off64_t offset = entry->offset + count;
 
-    // Safe conversion because kBufSize is narrow enough for a 32 bit signed value.
-    const uint32_t block_size =
-        (remaining > kBufSize) ? kBufSize : static_cast<uint32_t>(remaining);
+    // Safe conversion because even kBufSize is narrow enough for a 32 bit signed value.
+    const auto block_size = static_cast<uint32_t>(std::min(remaining, uint64_t(buf.size())));
 
     // Make sure to read at offset to ensure concurrent access to the fd.
     const auto read_buf = mapped_zip.ReadAtOffset(buf.data(), block_size, offset);
@@ -1560,19 +1566,23 @@ int32_t ProcessZipEntryContents(ZipArchiveHandle archive, const ZipEntry64* entr
 
 #endif  // !ZIPARCHIVE_DISABLE_CALLBACK_API && !defined(_WIN32)
 
-int MappedZipFile::GetFileDescriptor() const {
-  if (!has_fd_) {
-    ALOGW("Zip: MappedZipFile doesn't have a file descriptor.");
-    return -1;
+MappedZipFile::MappedZipFile(int fd, off64_t length, off64_t offset)
+    : fd_(fd), fd_offset_(offset), data_length_(length) {
+  // GetFileLength() here fills |data_length_| if it was empty
+  if (fd >= 0 && GetFileLength() > 0 && GetFileLength() < std::numeric_limits<size_t>::max()) {
+    mapped_file_ =
+        android::base::MappedFile::FromFd(fd, fd_offset_, size_t(data_length_), PROT_READ);
+    if (mapped_file_) {
+      base_ptr_ = mapped_file_->data();
+    }
   }
+}
+
+int MappedZipFile::GetFileDescriptor() const {
   return fd_;
 }
 
 const void* MappedZipFile::GetBasePtr() const {
-  if (has_fd_) {
-    ALOGW("Zip: MappedZipFile doesn't have a base pointer.");
-    return nullptr;
-  }
   return base_ptr_;
 }
 
@@ -1581,60 +1591,37 @@ off64_t MappedZipFile::GetFileOffset() const {
 }
 
 off64_t MappedZipFile::GetFileLength() const {
-  if (has_fd_) {
-    if (data_length_ != -1) {
-      return data_length_;
-    }
-    data_length_ = lseek64(fd_, 0, SEEK_END);
-    if (data_length_ == -1) {
-      ALOGE("Zip: lseek on fd %d failed: %s", fd_, strerror(errno));
-    }
-    return data_length_;
-  } else {
-    if (base_ptr_ == nullptr) {
-      ALOGE("Zip: invalid file map");
-      return -1;
-    }
+  if (data_length_ >= 0) {
     return data_length_;
   }
+  if (fd_ < 0) {
+    ALOGE("Zip: invalid file map");
+  } else {
+    struct stat st;
+    if (fstat(fd_, &st)) {
+      ALOGE("Zip: fstat(%d) failed: %s", fd_, strerror(errno));
+    } else {
+      if (S_ISBLK(st.st_mode)) {
+#if defined(__linux__)
+        // Block devices are special - they report 0 as st_size.
+        uint64_t size;
+        if (ioctl(fd_, BLKGETSIZE64, &size)) {
+          ALOGE("Zip: ioctl(%d, BLKGETSIZE64) failed: %s", fd_, strerror(errno));
+        } else {
+          data_length_ = size - fd_offset_;
+        }
+#endif
+      } else {
+        data_length_ = st.st_size - fd_offset_;
+      }
+    }
+  }
+  return data_length_;
 }
 
 // Attempts to read |len| bytes into |buf| at offset |off|.
 const uint8_t* MappedZipFile::ReadAtOffset(uint8_t* buf, size_t len, off64_t off) const {
-  if (has_fd_) {
-    if (off < 0) {
-      ALOGE("Zip: invalid offset %" PRId64, off);
-      return nullptr;
-    }
-
-    off64_t read_offset;
-    if (__builtin_add_overflow(fd_offset_, off, &read_offset)) {
-      ALOGE("Zip: invalid read offset %" PRId64 " overflows, fd offset %" PRId64, off, fd_offset_);
-      return nullptr;
-    }
-
-    if (data_length_ != -1) {
-      off64_t read_end;
-      if (len > std::numeric_limits<off64_t>::max() ||
-          __builtin_add_overflow(off, static_cast<off64_t>(len), &read_end)) {
-        ALOGE("Zip: invalid read length %" PRId64 " overflows, offset %" PRId64,
-              static_cast<off64_t>(len), off);
-        return nullptr;
-      }
-
-      if (read_end > data_length_) {
-        ALOGE("Zip: invalid read length %" PRId64 " exceeds data length %" PRId64 ", offset %"
-              PRId64, static_cast<off64_t>(len), data_length_, off);
-        return nullptr;
-      }
-    }
-
-    if (!android::base::ReadFullyAtOffset(fd_, buf, len, read_offset)) {
-      ALOGE("Zip: failed to read at offset %" PRId64, off);
-      return nullptr;
-    }
-    return buf;
-  } else {
+  if (base_ptr_) {
     if (off < 0 || data_length_ < len || off > data_length_ - len) {
       ALOGE("Zip: invalid offset: %" PRId64 ", read length: %zu, data length: %" PRId64, off, len,
             data_length_);
@@ -1642,6 +1629,43 @@ const uint8_t* MappedZipFile::ReadAtOffset(uint8_t* buf, size_t len, off64_t off
     }
     return static_cast<const uint8_t*>(base_ptr_) + off;
   }
+  if (fd_ < 0) {
+    ALOGE("Zip: invalid zip file");
+    return nullptr;
+  }
+
+  if (off < 0) {
+    ALOGE("Zip: invalid offset %" PRId64, off);
+    return nullptr;
+  }
+
+  off64_t read_offset;
+  if (__builtin_add_overflow(fd_offset_, off, &read_offset)) {
+    ALOGE("Zip: invalid read offset %" PRId64 " overflows, fd offset %" PRId64, off, fd_offset_);
+    return nullptr;
+  }
+
+  if (data_length_ != -1) {
+    off64_t read_end;
+    if (len > std::numeric_limits<off64_t>::max() ||
+        __builtin_add_overflow(off, static_cast<off64_t>(len), &read_end)) {
+      ALOGE("Zip: invalid read length %" PRId64 " overflows, offset %" PRId64,
+            static_cast<off64_t>(len), off);
+      return nullptr;
+    }
+
+    if (read_end > data_length_) {
+      ALOGE("Zip: invalid read length %" PRId64 " exceeds data length %" PRId64 ", offset %" PRId64,
+            static_cast<off64_t>(len), data_length_, off);
+      return nullptr;
+    }
+  }
+
+  if (!android::base::ReadFullyAtOffset(fd_, buf, len, read_offset)) {
+    ALOGE("Zip: failed to read at offset %" PRId64, off);
+    return nullptr;
+  }
+  return buf;
 }
 
 void CentralDirectory::Initialize(const void* map_base_ptr, off64_t cd_start_offset,
@@ -1651,7 +1675,7 @@ void CentralDirectory::Initialize(const void* map_base_ptr, off64_t cd_start_off
 }
 
 bool ZipArchive::InitializeCentralDirectory(off64_t cd_start_offset, size_t cd_size) {
-  if (mapped_zip.HasFd()) {
+  if (!mapped_zip.GetBasePtr()) {
     directory_map = android::base::MappedFile::FromFd(mapped_zip.GetFileDescriptor(),
                                                       mapped_zip.GetFileOffset() + cd_start_offset,
                                                       cd_size, PROT_READ);
@@ -1665,14 +1689,16 @@ bool ZipArchive::InitializeCentralDirectory(off64_t cd_start_offset, size_t cd_s
     central_directory.Initialize(directory_map->data(), 0 /*offset*/, cd_size);
   } else {
     if (mapped_zip.GetBasePtr() == nullptr) {
-      ALOGE("Zip: Failed to map central directory, bad mapped_zip base pointer");
+      ALOGE(
+          "Zip: Failed to map central directory, bad mapped_zip base "
+          "pointer");
       return false;
     }
     if (static_cast<off64_t>(cd_start_offset) + static_cast<off64_t>(cd_size) >
         mapped_zip.GetFileLength()) {
       ALOGE(
-          "Zip: Failed to map central directory, offset exceeds mapped memory region ("
-          "start_offset %" PRId64 ", cd_size %zu, mapped_region_size %" PRId64 ")",
+          "Zip: Failed to map central directory, offset exceeds mapped memory region (start_offset "
+          "%" PRId64 ", cd_size %zu, mapped_region_size %" PRId64 ")",
           static_cast<int64_t>(cd_start_offset), cd_size, mapped_zip.GetFileLength());
       return false;
     }
