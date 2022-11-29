@@ -28,6 +28,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "android-base/macros.h"
 #include "android-base/off64_t.h"
@@ -324,6 +325,10 @@ class Writer {
  public:
   virtual bool Append(uint8_t* buf, size_t buf_size) = 0;
 
+  // Returns the internal buffer that can we written into directly.
+  using Buffer = std::pair<uint8_t*, size_t>;
+  virtual Buffer GetBuffer(size_t length);
+
  protected:
   Writer() = default;
   ~Writer() = default;
@@ -338,6 +343,9 @@ class LowLevelReader {
   // or returning an internal buffer directly.
   // Returns a pointer to the data (which can be different from |buf|), or |nullptr| on error.
   virtual const uint8_t* AccessAtOffset(uint8_t* buf, size_t len, off64_t offset) const = 0;
+
+  // Returns |true| if the reader doesn't need an external buffer but instead returns its own one.
+  virtual bool IsZeroCopy() const = 0;
 
  protected:
   LowLevelReader() = default;
@@ -354,6 +362,7 @@ class Reader : public LowLevelReader {
   // Ensure the existing classes implementing Reader don't need to bother with
   // the new method.
   const uint8_t* AccessAtOffset(uint8_t* buf, size_t len, off64_t offset) const override;
+  bool IsZeroCopy() const override;
 
  protected:
   Reader() = default;

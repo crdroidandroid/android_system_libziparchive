@@ -1140,6 +1140,10 @@ class MemoryWriter final : public zip_archive::Writer {
   }
 
   virtual bool Append(uint8_t* buf, size_t buf_size) override {
+    if (buf_size == 0 || (buf >= buf_ && buf < buf_ + size_)) {
+      return true;
+    }
+
     if (size_ < buf_size || bytes_written_ > size_ - buf_size) {
       ALOGW("Zip: Unexpected size %zu (declared) vs %zu (actual)", size_,
             bytes_written_ + buf_size);
@@ -1151,7 +1155,18 @@ class MemoryWriter final : public zip_archive::Writer {
     return true;
   }
 
-  MemoryWriter(uint8_t* buf, size_t size) : Writer(), buf_(buf), size_(size), bytes_written_(0) {}
+  Buffer GetBuffer(size_t length) override {
+    if (length > size_) {
+      // Special case for empty files: zlib wants at least some buffer but won't ever write there.
+      if (size_ == 0 && length <= sizeof(bytes_written_)) {
+        return {reinterpret_cast<uint8_t*>(&bytes_written_), length};
+      }
+      return {};
+    }
+    return {buf_, length};
+  }
+
+  MemoryWriter(uint8_t* buf, size_t size) : buf_(buf), size_(size), bytes_written_(0) {}
 
  private:
   uint8_t* const buf_{nullptr};
@@ -1271,6 +1286,8 @@ class EntryReader final : public zip_archive::Reader {
     return zip_file_.ReadAtOffset(buf, len, entry_->offset + offset);
   }
 
+  bool IsZeroCopy() const override { return zip_file_.GetBasePtr() != nullptr; }
+
  private:
   const MappedZipFile& zip_file_;
   const ZipEntry64* entry_;
@@ -1287,11 +1304,23 @@ static inline int zlib_inflateInit2(z_stream* stream, int window_bits) {
 namespace zip_archive {
 
 // Moved out of line to avoid -Wweak-vtables.
+auto Writer::GetBuffer(size_t) -> Buffer {
+  return {};
+}
+
 const uint8_t* Reader::AccessAtOffset(uint8_t* buf, size_t len, off64_t offset) const {
   return ReadAtOffset(buf, len, offset) ? buf : nullptr;
 }
 
+bool Reader::IsZeroCopy() const {
+  return false;
+}
+
 }  // namespace zip_archive
+
+static std::span<uint8_t> bufferToSpan(zip_archive::Writer::Buffer buf) {
+  return {buf.first, ssize_t(buf.second)};
+}
 
 template <bool OnIncfs>
 static int32_t inflateImpl(const zip_archive::Reader& reader,
@@ -1299,30 +1328,48 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
                            const uint64_t uncompressed_length,
                            zip_archive::Writer* writer, uint64_t* crc_out) {
   constexpr uint64_t kBufSize = 32768;
-  std::vector<uint8_t> read_buf(static_cast<size_t>(std::min(compressed_length, kBufSize)));
-  std::vector<uint8_t> write_buf(
-      static_cast<size_t>(std::min(std::max(compressed_length, uncompressed_length), kBufSize)));
-  z_stream zstream;
-  int zerr;
+
+  std::vector<uint8_t> read_buf;
+  uint64_t max_read_size;
+  if (reader.IsZeroCopy()) {
+    max_read_size = std::min<uint64_t>(std::numeric_limits<uint32_t>::max(), compressed_length);
+  } else {
+    max_read_size = std::min(compressed_length, kBufSize);
+    read_buf.resize(static_cast<size_t>(max_read_size));
+  }
+
+  std::vector<uint8_t> write_buf;
+  // For some files zlib needs more space than the uncompressed buffer size, e.g. when inflating
+  // an empty file.
+  const auto min_write_buffer_size = std::max(compressed_length, uncompressed_length);
+  auto write_span = bufferToSpan(writer->GetBuffer(size_t(min_write_buffer_size)));
+  bool direct_writer;
+  if (write_span.size() >= min_write_buffer_size) {
+    direct_writer = true;
+  } else {
+    direct_writer = false;
+    write_buf.resize(static_cast<size_t>(std::min(min_write_buffer_size, kBufSize)));
+    write_span = write_buf;
+  }
 
   /*
    * Initialize the zlib stream struct.
    */
-  memset(&zstream, 0, sizeof(zstream));
+  z_stream zstream = {};
   zstream.zalloc = Z_NULL;
   zstream.zfree = Z_NULL;
   zstream.opaque = Z_NULL;
   zstream.next_in = NULL;
   zstream.avail_in = 0;
-  zstream.next_out = &write_buf[0];
-  zstream.avail_out = static_cast<uint32_t>(write_buf.size());
+  zstream.next_out = write_span.data();
+  zstream.avail_out = static_cast<uint32_t>(write_span.size());
   zstream.data_type = Z_UNKNOWN;
 
   /*
    * Use the undocumented "negative window bits" feature to tell zlib
    * that there's no zlib header waiting for it.
    */
-  zerr = zlib_inflateInit2(&zstream, -MAX_WBITS);
+  int zerr = zlib_inflateInit2(&zstream, -MAX_WBITS);
   if (zerr != Z_OK) {
     if (zerr == Z_VERSION_ERROR) {
       ALOGE("Installed zlib is not compatible with linked version (%s)", ZLIB_VERSION);
@@ -1338,6 +1385,7 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
   };
 
   std::unique_ptr<z_stream, decltype(zstream_deleter)> zstream_guard(&zstream, zstream_deleter);
+  static_assert(sizeof(zstream_guard) == sizeof(void*));
 
   SCOPED_SIGBUS_HANDLER_CONDITIONAL(OnIncfs, {
     zstream_guard.reset();
@@ -1353,10 +1401,8 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
   do {
     /* read as much as we can */
     if (zstream.avail_in == 0) {
-      const auto read_size =
-          static_cast<uint32_t>(std::min(remaining_bytes, uint64_t(read_buf.size())));
+      const auto read_size = static_cast<uint32_t>(std::min(remaining_bytes, max_read_size));
       const off64_t offset = (compressed_length - remaining_bytes);
-      // Make sure to read at offset to ensure concurrent access to the fd.
       auto buf = reader.AccessAtOffset(read_buf.data(), read_size, offset);
       if (!buf) {
         ALOGW("Zip: inflate read failed, getSize = %u: %s", read_size, strerror(errno));
@@ -1378,18 +1424,25 @@ static int32_t inflateImpl(const zip_archive::Reader& reader,
     }
 
     /* write when we're full or when we're done */
-    if (zstream.avail_out == 0 || (zerr == Z_STREAM_END && zstream.avail_out != write_buf.size())) {
-      const size_t write_size = zstream.next_out - &write_buf[0];
-      if (!writer->Append(&write_buf[0], write_size)) {
+    if (zstream.avail_out == 0 ||
+        (zerr == Z_STREAM_END && zstream.avail_out != write_span.size())) {
+      const size_t write_size = zstream.next_out - write_span.data();
+      if (compute_crc) {
+        DCHECK_LE(write_size, write_span.size());
+        crc = crc32(crc, write_span.data(), static_cast<uint32_t>(write_size));
+      }
+      total_output += write_span.size() - zstream.avail_out;
+
+      if (direct_writer) {
+        write_span = write_span.subspan(write_size);
+      } else if (!writer->Append(write_span.data(), write_size)) {
         return kIoError;
-      } else if (compute_crc) {
-        DCHECK_LE(write_size, write_buf.size());
-        crc = crc32(crc, &write_buf[0], static_cast<uint32_t>(write_size));
       }
 
-      total_output += write_buf.size() - zstream.avail_out;
-      zstream.next_out = &write_buf[0];
-      zstream.avail_out = static_cast<uint32_t>(write_buf.size());
+      if (zstream.avail_out == 0) {
+        zstream.next_out = write_span.data();
+        zstream.avail_out = static_cast<uint32_t>(write_span.size());
+      }
     }
   } while (zerr == Z_OK);
 
@@ -1423,7 +1476,23 @@ static int32_t InflateEntryToWriter(MappedZipFile& mapped_zip, const ZipEntry64*
 static int32_t CopyEntryToWriter(MappedZipFile& mapped_zip, const ZipEntry64* entry,
                                  zip_archive::Writer* writer, uint64_t* crc_out) {
   constexpr uint64_t kBufSize = 32768;
-  std::vector<uint8_t> buf(static_cast<size_t>(std::min(entry->uncompressed_length, kBufSize)));
+  std::vector<uint8_t> buf;
+  std::span<uint8_t> write_span{};
+  uint64_t max_read_size;
+  if (mapped_zip.GetBasePtr() == nullptr ||
+      mapped_zip.GetFileLength() < entry->uncompressed_length) {
+    // Check if we can read directly into the writer.
+    write_span = bufferToSpan(writer->GetBuffer(size_t(entry->uncompressed_length)));
+    if (write_span.size() >= entry->uncompressed_length) {
+      max_read_size = entry->uncompressed_length;
+    } else {
+      max_read_size = std::min(entry->uncompressed_length, kBufSize);
+      buf.resize((static_cast<size_t>(max_read_size)));
+      write_span = buf;
+    }
+  } else {
+    max_read_size = entry->uncompressed_length;
+  }
 
   SCOPED_SIGBUS_HANDLER({
     incfs::util::clearAndFree(buf);
@@ -1438,10 +1507,9 @@ static int32_t CopyEntryToWriter(MappedZipFile& mapped_zip, const ZipEntry64* en
     off64_t offset = entry->offset + count;
 
     // Safe conversion because even kBufSize is narrow enough for a 32 bit signed value.
-    const auto block_size = static_cast<uint32_t>(std::min(remaining, uint64_t(buf.size())));
+    const auto block_size = static_cast<uint32_t>(std::min(remaining, max_read_size));
 
-    // Make sure to read at offset to ensure concurrent access to the fd.
-    const auto read_buf = mapped_zip.ReadAtOffset(buf.data(), block_size, offset);
+    const auto read_buf = mapped_zip.ReadAtOffset(write_span.data(), block_size, offset);
     if (!read_buf) {
       ALOGW("CopyFileToFile: copy read failed, block_size = %u, offset = %" PRId64 ": %s",
             block_size, static_cast<int64_t>(offset), strerror(errno));
@@ -1450,6 +1518,10 @@ static int32_t CopyEntryToWriter(MappedZipFile& mapped_zip, const ZipEntry64* en
 
     if (!writer->Append(const_cast<uint8_t*>(read_buf), block_size)) {
       return kIoError;
+    }
+    // Advance our span if it's a direct buffer (there's a span but local buffer's empty).
+    if (!write_span.empty() && buf.empty()) {
+      write_span = write_span.subspan(block_size);
     }
     if (crc_out) {
       crc = crc32(crc, read_buf, block_size);
@@ -1661,6 +1733,7 @@ const uint8_t* MappedZipFile::ReadAtOffset(uint8_t* buf, size_t len, off64_t off
     }
   }
 
+  // Make sure to read at offset to ensure concurrent access to the fd.
   if (!android::base::ReadFullyAtOffset(fd_, buf, len, read_offset)) {
     ALOGE("Zip: failed to read at offset %" PRId64, off);
     return nullptr;
