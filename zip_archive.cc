@@ -492,23 +492,12 @@ static ZipError ParseZipArchive(ZipArchive* archive) {
 
   const uint8_t* const cd_ptr = archive->central_directory.GetBasePtr();
   const size_t cd_length = archive->central_directory.GetMapLength();
-  const uint64_t num_entries = archive->num_entries;
-
-  if (num_entries <= UINT16_MAX) {
-    archive->cd_entry_map = CdEntryMapZip32::Create(static_cast<uint16_t>(num_entries));
-  } else {
-    archive->cd_entry_map = CdEntryMapZip64::Create();
-  }
-  if (archive->cd_entry_map == nullptr) {
-    return kAllocationFailed;
-  }
-
-  /*
-   * Walk through the central directory, adding entries to the hash
-   * table and verifying values.
-   */
   const uint8_t* const cd_end = cd_ptr + cd_length;
+  const uint64_t num_entries = archive->num_entries;
   const uint8_t* ptr = cd_ptr;
+  uint16_t max_file_name_length = 0;
+
+  /* Walk through the central directory and verify values */
   for (uint64_t i = 0; i < num_entries; i++) {
     if (ptr > cd_end - sizeof(CentralDirectoryRecord)) {
       ALOGW("Zip: ran off the end (item #%" PRIu64 ", %zu bytes of central directory)", i,
@@ -536,6 +525,8 @@ static ZipError ParseZipArchive(ZipArchive* archive) {
             i, file_name_length, cd_length);
       return kInvalidEntryName;
     }
+
+    max_file_name_length = std::max(max_file_name_length, file_name_length);
 
     const uint8_t* extra_field = file_name + file_name_length;
     if (extra_length >= cd_length || extra_field > cd_end - extra_length) {
@@ -570,20 +561,31 @@ static ZipError ParseZipArchive(ZipArchive* archive) {
       return kInvalidEntryName;
     }
 
-    // Add the CDE filename to the hash table.
-    std::string_view entry_name{reinterpret_cast<const char*>(file_name), file_name_length};
-    if (auto add_result =
-            archive->cd_entry_map->AddToMap(entry_name, archive->central_directory.GetBasePtr());
-        add_result != 0) {
-      ALOGW("Zip: Error adding entry to hash table %d", add_result);
-      return add_result;
-    }
-
     ptr += sizeof(CentralDirectoryRecord) + file_name_length + extra_length + comment_length;
     if ((ptr - cd_ptr) > static_cast<int64_t>(cd_length)) {
       ALOGW("Zip: bad CD advance (%tu vs %zu) at entry %" PRIu64, ptr - cd_ptr, cd_length, i);
       return kInvalidFile;
     }
+  }
+
+  /* Create memory efficient entry map */
+  archive->cd_entry_map = CdEntryMapInterface::Create(num_entries, cd_length, max_file_name_length);
+  if (archive->cd_entry_map == nullptr) {
+    return kAllocationFailed;
+  }
+
+  /* Central directory verified, now add entries to the hash table */
+  ptr = cd_ptr;
+  for (uint64_t i = 0; i < num_entries; i++) {
+    auto cdr = reinterpret_cast<const CentralDirectoryRecord*>(ptr);
+    std::string_view entry_name{reinterpret_cast<const char*>(ptr + sizeof(*cdr)),
+                                cdr->file_name_length};
+    auto add_result = archive->cd_entry_map->AddToMap(entry_name, cd_ptr);
+    if (add_result != 0) {
+      ALOGW("Zip: Error adding entry to hash table %d", add_result);
+      return add_result;
+    }
+    ptr += sizeof(*cdr) + cdr->file_name_length + cdr->extra_field_length + cdr->comment_length;
   }
 
   uint32_t lfh_start_bytes_buf;
