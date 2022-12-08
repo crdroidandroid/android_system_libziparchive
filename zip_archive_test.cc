@@ -70,8 +70,10 @@ class CdEntryMapTest : public ::testing::Test {
     joined_names_ = header_ + android::base::Join(names_, separator_);
     base_ptr_ = reinterpret_cast<uint8_t*>(&joined_names_[0]);
 
-    entry_maps_.emplace_back(CdEntryMapZip32::Create(static_cast<uint16_t>(names_.size())));
-    entry_maps_.emplace_back(CdEntryMapZip64::Create());
+    uint16_t num_entries = static_cast<uint16_t>(names_.size());
+    entry_maps_.emplace_back(new CdEntryMapZip32<ZipStringOffset20>(num_entries));
+    entry_maps_.emplace_back(new CdEntryMapZip32<ZipStringOffset32>(num_entries));
+    entry_maps_.emplace_back(new CdEntryMapZip64());
     for (auto& cd_map : entry_maps_) {
       ASSERT_NE(nullptr, cd_map);
       size_t offset = header_.size();
