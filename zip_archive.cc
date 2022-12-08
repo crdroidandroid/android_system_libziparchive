@@ -34,6 +34,7 @@
 #ifdef __linux__
 #include <linux/fs.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #endif
 
 #include <memory>
@@ -96,8 +97,54 @@ static constexpr uint64_t kMaxFileLength = 256 * static_cast<uint64_t>(1u << 30u
  * of the string length into the hash table entry.
  */
 
+constexpr auto kPageSize = 4096;
+
+[[maybe_unused]] static constexpr uintptr_t pageAlignDown(uintptr_t ptr_int) {
+  return ptr_int & ~(kPageSize - 1);
+}
+
+[[maybe_unused]] static constexpr uintptr_t pageAlignUp(uintptr_t ptr_int) {
+  return pageAlignDown(ptr_int + kPageSize - 1);
+}
+
+[[maybe_unused]] static std::pair<void*, size_t> expandToPageBounds(void* ptr, size_t size) {
+  const auto ptr_int = reinterpret_cast<uintptr_t>(ptr);
+  const auto aligned_ptr_int = pageAlignDown(ptr_int);
+  const auto aligned_size = pageAlignUp(ptr_int + size) - aligned_ptr_int;
+  return {reinterpret_cast<void*>(aligned_ptr_int), aligned_size};
+}
+
+static void maybePrefetch([[maybe_unused]] const void* ptr, [[maybe_unused]] size_t size) {
+#ifdef __linux__
+  // Let's only ask for a readahead explicitly if there's enough pages to read. A regular OS
+  // readahead implementation would take care of the smaller requests, and it would also involve
+  // only a single kernel transition, just an implicit one from the page fault.
+  //
+  // Note: there's no implementation for other OSes, as the prefetch logic is highly specific
+  // to the memory manager, and we don't have any well defined benchmarks on Windows/Mac;
+  // it also mostly matters only for the cold OS boot where no files are in the page cache yet,
+  // but we rarely would hit this situation outside of the device startup.
+  auto [aligned_ptr, aligned_size] = expandToPageBounds(const_cast<void*>(ptr), size);
+  if (aligned_size > 32 * kPageSize) {
+    if (::madvise(aligned_ptr, aligned_size, MADV_WILLNEED)) {
+      ALOGW("Zip: madvise(file, WILLNEED) failed: %s (%d)", strerror(errno), errno);
+    }
+  }
+#endif
+}
+
+static void maybePrepareSequentialReading([[maybe_unused]] const void* ptr,
+                                          [[maybe_unused]] size_t size) {
+#ifdef __linux__
+  auto [aligned_ptr, aligned_size] = expandToPageBounds(const_cast<void*>(ptr), size);
+  if (::madvise(reinterpret_cast<void*>(aligned_ptr), aligned_size, MADV_SEQUENTIAL)) {
+    ALOGW("Zip: madvise(file, SEQUENTIAL) failed: %s (%d)", strerror(errno), errno);
+  }
+#endif
+}
+
 #if defined(__BIONIC__)
-uint64_t GetOwnerTag(const ZipArchive* archive) {
+static uint64_t GetOwnerTag(const ZipArchive* archive) {
   return android_fdsan_create_owner_tag(ANDROID_FDSAN_OWNER_TYPE_ZIPARCHIVE,
                                         reinterpret_cast<uint64_t>(archive));
 }
@@ -333,7 +380,7 @@ static ZipError MapCentralDirectory(const char* debug_file_name, ZipArchive* arc
    *
    * We start by pulling in the last part of the file.
    */
-  const auto read_amount = std::min(uint32_t(file_length), kMaxEOCDSearch);
+  const auto read_amount = uint32_t(std::min<off64_t>(file_length, kMaxEOCDSearch));
 
   CentralDirectoryInfo cdInfo = {};
   std::vector<uint8_t> scan_buffer(read_amount);
@@ -490,6 +537,7 @@ static ZipError ParseZip64ExtendedInfoInExtraField(
 static ZipError ParseZipArchive(ZipArchive* archive) {
   SCOPED_SIGBUS_HANDLER(return kIoError);
 
+  maybePrefetch(archive->central_directory.GetBasePtr(), archive->central_directory.GetMapLength());
   const uint8_t* const cd_ptr = archive->central_directory.GetBasePtr();
   const size_t cd_length = archive->central_directory.GetMapLength();
   const uint8_t* const cd_end = cd_ptr + cd_length;
@@ -1642,11 +1690,12 @@ int32_t ProcessZipEntryContents(ZipArchiveHandle archive, const ZipEntry64* entr
 
 MappedZipFile::MappedZipFile(int fd, off64_t length, off64_t offset)
     : fd_(fd), fd_offset_(offset), data_length_(length) {
-  // GetFileLength() here fills |data_length_| if it was empty
+  // GetFileLength() here fills |data_length_| if it was empty.
   if (fd >= 0 && GetFileLength() > 0 && GetFileLength() < std::numeric_limits<size_t>::max()) {
     mapped_file_ =
         android::base::MappedFile::FromFd(fd, fd_offset_, size_t(data_length_), PROT_READ);
     if (mapped_file_) {
+      maybePrepareSequentialReading(mapped_file_->data(), size_t(data_length_));
       base_ptr_ = mapped_file_->data();
     }
   }
@@ -1701,6 +1750,7 @@ const uint8_t* MappedZipFile::ReadAtOffset(uint8_t* buf, size_t len, off64_t off
             data_length_);
       return nullptr;
     }
+    maybePrefetch(static_cast<const uint8_t*>(base_ptr_) + off, len);
     return static_cast<const uint8_t*>(base_ptr_) + off;
   }
   if (fd_ < 0) {
