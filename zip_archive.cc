@@ -34,6 +34,7 @@
 #ifdef __linux__
 #include <linux/fs.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #endif
 
 #include <memory>
@@ -96,8 +97,54 @@ static constexpr uint64_t kMaxFileLength = 256 * static_cast<uint64_t>(1u << 30u
  * of the string length into the hash table entry.
  */
 
+constexpr auto kPageSize = 4096;
+
+[[maybe_unused]] static constexpr uintptr_t pageAlignDown(uintptr_t ptr_int) {
+  return ptr_int & ~(kPageSize - 1);
+}
+
+[[maybe_unused]] static constexpr uintptr_t pageAlignUp(uintptr_t ptr_int) {
+  return pageAlignDown(ptr_int + kPageSize - 1);
+}
+
+[[maybe_unused]] static std::pair<void*, size_t> expandToPageBounds(void* ptr, size_t size) {
+  const auto ptr_int = reinterpret_cast<uintptr_t>(ptr);
+  const auto aligned_ptr_int = pageAlignDown(ptr_int);
+  const auto aligned_size = pageAlignUp(ptr_int + size) - aligned_ptr_int;
+  return {reinterpret_cast<void*>(aligned_ptr_int), aligned_size};
+}
+
+static void maybePrefetch([[maybe_unused]] const void* ptr, [[maybe_unused]] size_t size) {
+#ifdef __linux__
+  // Let's only ask for a readahead explicitly if there's enough pages to read. A regular OS
+  // readahead implementation would take care of the smaller requests, and it would also involve
+  // only a single kernel transition, just an implicit one from the page fault.
+  //
+  // Note: there's no implementation for other OSes, as the prefetch logic is highly specific
+  // to the memory manager, and we don't have any well defined benchmarks on Windows/Mac;
+  // it also mostly matters only for the cold OS boot where no files are in the page cache yet,
+  // but we rarely would hit this situation outside of the device startup.
+  auto [aligned_ptr, aligned_size] = expandToPageBounds(const_cast<void*>(ptr), size);
+  if (aligned_size > 32 * kPageSize) {
+    if (::madvise(aligned_ptr, aligned_size, MADV_WILLNEED)) {
+      ALOGW("Zip: madvise(file, WILLNEED) failed: %s (%d)", strerror(errno), errno);
+    }
+  }
+#endif
+}
+
+static void maybePrepareSequentialReading([[maybe_unused]] const void* ptr,
+                                          [[maybe_unused]] size_t size) {
+#ifdef __linux__
+  auto [aligned_ptr, aligned_size] = expandToPageBounds(const_cast<void*>(ptr), size);
+  if (::madvise(reinterpret_cast<void*>(aligned_ptr), aligned_size, MADV_SEQUENTIAL)) {
+    ALOGW("Zip: madvise(file, SEQUENTIAL) failed: %s (%d)", strerror(errno), errno);
+  }
+#endif
+}
+
 #if defined(__BIONIC__)
-uint64_t GetOwnerTag(const ZipArchive* archive) {
+static uint64_t GetOwnerTag(const ZipArchive* archive) {
   return android_fdsan_create_owner_tag(ANDROID_FDSAN_OWNER_TYPE_ZIPARCHIVE,
                                         reinterpret_cast<uint64_t>(archive));
 }
@@ -333,7 +380,7 @@ static ZipError MapCentralDirectory(const char* debug_file_name, ZipArchive* arc
    *
    * We start by pulling in the last part of the file.
    */
-  const auto read_amount = std::min(uint32_t(file_length), kMaxEOCDSearch);
+  const auto read_amount = uint32_t(std::min<off64_t>(file_length, kMaxEOCDSearch));
 
   CentralDirectoryInfo cdInfo = {};
   std::vector<uint8_t> scan_buffer(read_amount);
@@ -490,25 +537,15 @@ static ZipError ParseZip64ExtendedInfoInExtraField(
 static ZipError ParseZipArchive(ZipArchive* archive) {
   SCOPED_SIGBUS_HANDLER(return kIoError);
 
+  maybePrefetch(archive->central_directory.GetBasePtr(), archive->central_directory.GetMapLength());
   const uint8_t* const cd_ptr = archive->central_directory.GetBasePtr();
   const size_t cd_length = archive->central_directory.GetMapLength();
-  const uint64_t num_entries = archive->num_entries;
-
-  if (num_entries <= UINT16_MAX) {
-    archive->cd_entry_map = CdEntryMapZip32::Create(static_cast<uint16_t>(num_entries));
-  } else {
-    archive->cd_entry_map = CdEntryMapZip64::Create();
-  }
-  if (archive->cd_entry_map == nullptr) {
-    return kAllocationFailed;
-  }
-
-  /*
-   * Walk through the central directory, adding entries to the hash
-   * table and verifying values.
-   */
   const uint8_t* const cd_end = cd_ptr + cd_length;
+  const uint64_t num_entries = archive->num_entries;
   const uint8_t* ptr = cd_ptr;
+  uint16_t max_file_name_length = 0;
+
+  /* Walk through the central directory and verify values */
   for (uint64_t i = 0; i < num_entries; i++) {
     if (ptr > cd_end - sizeof(CentralDirectoryRecord)) {
       ALOGW("Zip: ran off the end (item #%" PRIu64 ", %zu bytes of central directory)", i,
@@ -536,6 +573,8 @@ static ZipError ParseZipArchive(ZipArchive* archive) {
             i, file_name_length, cd_length);
       return kInvalidEntryName;
     }
+
+    max_file_name_length = std::max(max_file_name_length, file_name_length);
 
     const uint8_t* extra_field = file_name + file_name_length;
     if (extra_length >= cd_length || extra_field > cd_end - extra_length) {
@@ -570,20 +609,31 @@ static ZipError ParseZipArchive(ZipArchive* archive) {
       return kInvalidEntryName;
     }
 
-    // Add the CDE filename to the hash table.
-    std::string_view entry_name{reinterpret_cast<const char*>(file_name), file_name_length};
-    if (auto add_result =
-            archive->cd_entry_map->AddToMap(entry_name, archive->central_directory.GetBasePtr());
-        add_result != 0) {
-      ALOGW("Zip: Error adding entry to hash table %d", add_result);
-      return add_result;
-    }
-
     ptr += sizeof(CentralDirectoryRecord) + file_name_length + extra_length + comment_length;
     if ((ptr - cd_ptr) > static_cast<int64_t>(cd_length)) {
       ALOGW("Zip: bad CD advance (%tu vs %zu) at entry %" PRIu64, ptr - cd_ptr, cd_length, i);
       return kInvalidFile;
     }
+  }
+
+  /* Create memory efficient entry map */
+  archive->cd_entry_map = CdEntryMapInterface::Create(num_entries, cd_length, max_file_name_length);
+  if (archive->cd_entry_map == nullptr) {
+    return kAllocationFailed;
+  }
+
+  /* Central directory verified, now add entries to the hash table */
+  ptr = cd_ptr;
+  for (uint64_t i = 0; i < num_entries; i++) {
+    auto cdr = reinterpret_cast<const CentralDirectoryRecord*>(ptr);
+    std::string_view entry_name{reinterpret_cast<const char*>(ptr + sizeof(*cdr)),
+                                cdr->file_name_length};
+    auto add_result = archive->cd_entry_map->AddToMap(entry_name, cd_ptr);
+    if (add_result != 0) {
+      ALOGW("Zip: Error adding entry to hash table %d", add_result);
+      return add_result;
+    }
+    ptr += sizeof(*cdr) + cdr->file_name_length + cdr->extra_field_length + cdr->comment_length;
   }
 
   uint32_t lfh_start_bytes_buf;
@@ -1640,11 +1690,12 @@ int32_t ProcessZipEntryContents(ZipArchiveHandle archive, const ZipEntry64* entr
 
 MappedZipFile::MappedZipFile(int fd, off64_t length, off64_t offset)
     : fd_(fd), fd_offset_(offset), data_length_(length) {
-  // GetFileLength() here fills |data_length_| if it was empty
+  // GetFileLength() here fills |data_length_| if it was empty.
   if (fd >= 0 && GetFileLength() > 0 && GetFileLength() < std::numeric_limits<size_t>::max()) {
     mapped_file_ =
         android::base::MappedFile::FromFd(fd, fd_offset_, size_t(data_length_), PROT_READ);
     if (mapped_file_) {
+      maybePrepareSequentialReading(mapped_file_->data(), size_t(data_length_));
       base_ptr_ = mapped_file_->data();
     }
   }
@@ -1699,6 +1750,7 @@ const uint8_t* MappedZipFile::ReadAtOffset(uint8_t* buf, size_t len, off64_t off
             data_length_);
       return nullptr;
     }
+    maybePrefetch(static_cast<const uint8_t*>(base_ptr_) + off, len);
     return static_cast<const uint8_t*>(base_ptr_) + off;
   }
   if (fd_ < 0) {
