@@ -1690,8 +1690,10 @@ int32_t ProcessZipEntryContents(ZipArchiveHandle archive, const ZipEntry64* entr
 
 MappedZipFile::MappedZipFile(int fd, off64_t length, off64_t offset)
     : fd_(fd), fd_offset_(offset), data_length_(length) {
-  // GetFileLength() here fills |data_length_| if it was empty.
-  if (fd >= 0 && GetFileLength() > 0 && GetFileLength() < std::numeric_limits<size_t>::max()) {
+  // Note: GetFileLength() here fills |data_length_| if it was empty.
+  // TODO(b/261875471): remove the incfs exclusion when the driver deadlock is fixed.
+  if (fd >= 0 && !incfs::util::isIncfsFd(fd) && GetFileLength() > 0 &&
+      GetFileLength() < std::numeric_limits<size_t>::max()) {
     mapped_file_ =
         android::base::MappedFile::FromFd(fd, fd_offset_, size_t(data_length_), PROT_READ);
     if (mapped_file_) {
