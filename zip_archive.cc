@@ -114,7 +114,8 @@ constexpr auto kPageSize = 4096;
   return {reinterpret_cast<void*>(aligned_ptr_int), aligned_size};
 }
 
-static void maybePrefetch([[maybe_unused]] const void* ptr, [[maybe_unused]] size_t size) {
+[[maybe_unused]] static void maybePrefetch([[maybe_unused]] const void* ptr,
+                                           [[maybe_unused]] size_t size) {
 #ifdef __linux__
   // Let's only ask for a readahead explicitly if there's enough pages to read. A regular OS
   // readahead implementation would take care of the smaller requests, and it would also involve
@@ -133,8 +134,8 @@ static void maybePrefetch([[maybe_unused]] const void* ptr, [[maybe_unused]] siz
 #endif
 }
 
-static void maybePrepareSequentialReading([[maybe_unused]] const void* ptr,
-                                          [[maybe_unused]] size_t size) {
+[[maybe_unused]] static void maybePrepareSequentialReading([[maybe_unused]] const void* ptr,
+                                                           [[maybe_unused]] size_t size) {
 #ifdef __linux__
   auto [aligned_ptr, aligned_size] = expandToPageBounds(const_cast<void*>(ptr), size);
   if (::madvise(reinterpret_cast<void*>(aligned_ptr), aligned_size, MADV_SEQUENTIAL)) {
@@ -1690,15 +1691,19 @@ int32_t ProcessZipEntryContents(ZipArchiveHandle archive, const ZipEntry64* entr
 
 MappedZipFile::MappedZipFile(int fd, off64_t length, off64_t offset)
     : fd_(fd), fd_offset_(offset), data_length_(length) {
-  // Note: GetFileLength() here fills |data_length_| if it was empty.
-  // TODO(b/261875471): remove the incfs exclusion when the driver deadlock is fixed.
-  if (fd >= 0 && !incfs::util::isIncfsFd(fd) && GetFileLength() > 0 &&
-      GetFileLength() < std::numeric_limits<size_t>::max()) {
-    mapped_file_ =
-        android::base::MappedFile::FromFd(fd, fd_offset_, size_t(data_length_), PROT_READ);
-    if (mapped_file_) {
-      maybePrepareSequentialReading(mapped_file_->data(), size_t(data_length_));
-      base_ptr_ = mapped_file_->data();
+  // Only try to mmap all files in 64-bit+ processes as it's too easy to use up the whole
+  // virtual address space on 32-bits, causing out of memory errors later.
+  if constexpr (sizeof(void*) >= 8) {
+    // Note: GetFileLength() here fills |data_length_| if it was empty.
+    // TODO(b/261875471): remove the incfs exclusion when the driver deadlock is fixed.
+    if (fd >= 0 && !incfs::util::isIncfsFd(fd) && GetFileLength() > 0 &&
+        GetFileLength() < std::numeric_limits<size_t>::max()) {
+      mapped_file_ =
+          android::base::MappedFile::FromFd(fd, fd_offset_, size_t(data_length_), PROT_READ);
+      if (mapped_file_) {
+        maybePrepareSequentialReading(mapped_file_->data(), size_t(data_length_));
+        base_ptr_ = mapped_file_->data();
+      }
     }
   }
 }
