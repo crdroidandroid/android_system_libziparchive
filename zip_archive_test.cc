@@ -134,6 +134,12 @@ TEST_F(CdEntryMapTest, Iteration) {
 TEST(ziparchive, Open) {
   ZipArchiveHandle handle;
   ASSERT_EQ(0, OpenArchiveWrapper(kValidZip, &handle));
+  const auto& mappedFile = handle->mapped_zip;
+  if constexpr (sizeof(void*) < 8) {
+    ASSERT_EQ(nullptr, mappedFile.GetBasePtr());
+  } else {
+    ASSERT_NE(nullptr, mappedFile.GetBasePtr());
+  }
   CloseArchive(handle);
 
   ASSERT_EQ(kInvalidEntryName, OpenArchiveWrapper("bad_filename.zip", &handle));
